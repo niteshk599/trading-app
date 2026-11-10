@@ -27,42 +27,61 @@ st.title("🏛️ Apex Delta Trading Terminal")
 st.markdown("Institutional Smart Money Concepts | Live Data")
 
 # ==========================================
-# DATA FETCHER (DELTA + FALLBACK)
+# BULLETPROOF DATA FETCHER (Delta -> Binance -> Yahoo)
 # ==========================================
 @st.cache_data(ttl=60)
-def fetch_data(symbol, resolution, is_delta):
-    if is_delta:
-        # Delta Exchange API
+def fetch_data(asset, resolution):
+    # 1. TRY DELTA EXCHANGE
+    try:
         end_time = int(time.time())
-        # Fetch enough data for 200 EMA
         multiplier = 60 if resolution == '15m' else 3600 if resolution == '1h' else 14400
         start_time = end_time - (300 * multiplier)
-
-        url = f"https://api.delta.exchange/v2/history/candles?resolution={resolution}&symbol={symbol}&start={start_time}&end={end_time}"
-        try:
-            response = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=5)
-            data = response.json()
-            if 'result' in data and len(data['result']) > 0:
-                df = pd.DataFrame(data['result'])
-                df['time'] = pd.to_datetime(df['time'], unit='s')
-                df.set_index('time', inplace=True)
-                return df.sort_index(), "Delta Exchange (Live)"
-        except:
-            pass # Fall through to Yahoo if Delta fails
-            
-    # Fallback to Yahoo Finance (If Delta IP is blocked)
-    yf_symbol = "BTC-USD" if "BTC" in symbol else "ETH-USD" if "ETH" in symbol else "GC=F" if "XAU" in symbol else "SOL-USD"
-    interval = "15m" if resolution == "15m" else "1h" if resolution == "1h" else "1d"
-    period = "1mo" if resolution == "15m" else "3mo" if resolution == "1h" else "1y"
-    
-    try:
-        df = yf.download(yf_symbol, period=period, interval=interval, progress=False)
-        if not df.empty:
-            df.columns = [c.lower() for c in df.columns] # Lowercase for consistency
-            return df, "Yahoo Finance (Fallback)"
-    except:
+        # Map XAUTUSD for Delta
+        delta_symbol = "XAUTUSD" if asset == "GOLD" else asset
+        url = f"https://api.delta.exchange/v2/history/candles?resolution={resolution}&symbol={delta_symbol}&start={start_time}&end={end_time}"
+        response = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=5)
+        data = response.json()
+        if 'result' in data and len(data['result']) > 0:
+            df = pd.DataFrame(data['result'])
+            df['time'] = pd.to_datetime(df['time'], unit='s')
+            df.set_index('time', inplace=True)
+            return df.sort_index(), "Delta Exchange (Live)"
+    except Exception:
         pass
+
+    # 2. TRY BINANCE (Bulletproof fallback for Crypto & Gold)
+    try:
+        binance_symbol = "BTCUSDT" if asset == "BTCUSD" else "ETHUSDT" if asset == "ETHUSD" else "SOLUSDT" if asset == "SOLUSD" else "PAXGUSDT" if asset == "GOLD" else asset
+        binance_interval = "15m" if resolution == "15m" else "1h" if resolution == "1h" else "4h"
+        url = f"https://api.binance.com/api/v3/klines?symbol={binance_symbol}&interval={binance_interval}&limit=300"
+        response = requests.get(url, timeout=5)
+        data = response.json()
+        if isinstance(data, list) and len(data) > 0:
+            df = pd.DataFrame(data, columns=['time', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'qav', 'num_trades', 'tbbav', 'tbqav', 'ignore'])
+            df['time'] = pd.to_datetime(df['time'], unit='ms')
+            df.set_index('time', inplace=True)
+            for col in ['open', 'high', 'low', 'close']:
+                df[col] = df[col].astype(float)
+            return df, "Binance API (Fallback)"
+    except Exception:
+        pass
+
+    # 3. TRY YAHOO FINANCE (Fixed MultiIndex bug)
+    try:
+        yf_symbol = "BTC-USD" if asset == "BTCUSD" else "ETH-USD" if asset == "ETHUSD" else "SOL-USD" if asset == "SOLUSD" else "GC=F" if asset == "GOLD" else asset
+        yf_interval = "15m" if resolution == "15m" else "1h" if resolution == "1h" else "1d"
+        yf_period = "1mo" if resolution == "15m" else "3mo" if resolution == "1h" else "1y"
         
+        df = yf.download(yf_symbol, period=yf_period, interval=yf_interval, progress=False)
+        if not df.empty:
+            # FIX: Handle Yahoo's new MultiIndex columns
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
+            df.columns = [str(c).lower() for c in df.columns]
+            return df, "Yahoo Finance (Fallback)"
+    except Exception:
+        pass
+
     return pd.DataFrame(), "Failed"
 
 # ==========================================
@@ -119,8 +138,8 @@ def generate_signal(df, mode):
 # UI LAYOUT & SIDEBAR
 # ==========================================
 st.sidebar.header("⚙️ Terminal Settings")
-# Corrected Delta Symbols
-asset = st.sidebar.selectbox("Select Asset", ["BTCUSD", "ETHUSD", "XAUTUSD", "SOLUSD"])
+# Asset Options mapped for all APIs
+asset = st.sidebar.selectbox("Select Asset", ["BTCUSD", "ETHUSD", "SOLUSD", "GOLD"])
 trade_mode = st.sidebar.radio("Trading Strategy", ["Intraday (15m/1H)", "Swing (4H/1D)"])
 
 if trade_mode == "Intraday (15m/1H)":
@@ -128,8 +147,9 @@ if trade_mode == "Intraday (15m/1H)":
 else:
     resolution = "4h"
 
-# Fetch Data (Tries Delta first, falls back to Yahoo)
-df, data_source = fetch_data(asset, resolution, is_delta=True)
+# Fetch Data
+with st.spinner("Fetching live data and calculating institutional levels..."):
+    df, data_source = fetch_data(asset, resolution)
 
 if not df.empty:
     df = calculate_strategies(df)
@@ -213,4 +233,4 @@ if not df.empty:
         st.write(f"**Equilibrium:** `${(recent_high + recent_low)/2:,.2f}`")
 
 else:
-    st.error("Failed to fetch data from all sources. Please try again later.")
+    st.error("Data sources are currently blocked. Please wait 5 minutes and refresh the page.")
